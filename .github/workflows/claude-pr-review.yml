@@ -1,0 +1,97 @@
+name: Claude PR Review
+
+# Triggered by @claude mentions in PR comments. issue_comment /
+# pull_request_review_comment events ALWAYS run in the base-repo context with
+# secrets available — even for comments on PRs opened from forks — so this works
+# for external PRs where the stock `pull_request` review can't see the token.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # Gate everything behind an author check so only the repo owner can spend
+  # tokens / trigger Claude. Comparison is case-insensitive ("any cases").
+  authorize:
+    if: |
+      (github.event.issue.pull_request != null || github.event_name == 'pull_request_review_comment') &&
+      contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+    steps:
+      - id: check
+        env:
+          # Passed via env to avoid script injection from the comment payload.
+          LOGIN: ${{ github.event.comment.user.login }}
+        run: |
+          if [ "${LOGIN,,}" = "vistall" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "Ignoring @claude from '$LOGIN' (only vistall is authorized)."
+          fi
+
+  review:
+    needs: authorize
+    if: needs.authorize.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The built-in GITHUB_TOKEN (github-actions[bot]) can comment and post
+      # review suggestions thanks to the permissions block above. gh pr checkout
+      # handles fork PRs (open fork PRs are reachable via refs/pull/*), so Claude
+      # reads the actual PR head on disk.
+      - name: Checkout PR head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr checkout "$PR" --repo "$REPO"
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_MODEL: claude-opus-4-8
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Post one tracking comment at start and keep editing it in place with a
+          # live checklist (init / reviewing / …) as each step completes — instead
+          # of dropping a separate comment per step. Forces this even though we
+          # pass a custom prompt below.
+          track_progress: true
+          # The full comment is forwarded verbatim as the instruction. Only
+          # vistall can reach this point, so the trusted-input assumption holds.
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+
+            The maintainer left this comment on the PR — follow it exactly:
+            ---
+            ${{ github.event.comment.body }}
+            ---
+
+            The working tree is checked out at the PR head.
+
+            If the comment asks to "review with inline comments" (or otherwise
+            requests inline feedback), create inline review comments on the
+            specific lines and express each actionable change as a GitHub
+            ```suggestion block so the author can apply it with one click. Use
+            `gh api` against the PR review-comments endpoint to attach a comment
+            to a file + line, with the body containing the suggestion block.
+
+            Otherwise, post your response as a single PR comment with
+            `gh pr comment`.
+          claude_args: |
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Read,Grep,Glob"
